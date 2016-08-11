@@ -498,6 +498,127 @@ module.exports = (name, func) => {
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
  You may obtain a copy of the License at
+ http://www.apache.org/licenses/LICENSE-2.0
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ */
+
+/* eslint-env worker, serviceworker */
+
+const constants = require('./lib/constants.js');
+const enqueueRequest = require('./lib/enqueue-request.js');
+const log = require('../../../lib/log.js');
+const replayQueuedRequests = require('./lib/replay-queued-requests.js');
+
+/**
+ * In order to use the library, call`goog.offlineGoogleAnalytics.initialize()`.
+ * It will take care of setting up service worker `fetch` handlers to ensure
+ * that the Google Analytics JavaScript is available offline, and that any
+ * Google Analytics requests made while offline are saved (using `IndexedDB`)
+ * and retried the next time the service worker starts up.
+ *
+ * @example
+ * // This code should live inside your service worker JavaScript, ideally
+ * // before any other 'fetch' event handlers are defined:
+ *
+ * // First, import the library into the service worker global scope:
+ * importScripts('path/to/offline-google-analytics-import.js');
+ *
+ * // Then, call goog.offlineGoogleAnalytics.initialize():
+ * goog.offlineGoogleAnalytics.initialize({
+ *   parameterOverrides: {
+ *     // Optionally, pass in an Object with additional parameters that will be
+ *     // included in each replayed request.
+ *     // See https://developers.google.com/analytics/devguides/collection/protocol/v1/parameters
+ *     cd1: 'Some Value',
+ *     cd2: 'Some Other Value'
+ *   },
+ *   hitFilter: (searchParams) =>
+ *     // Sets the `qt` param as a custom metric.
+ *     const qt = searchParams.get('qt');
+ *     searchParams.set('qt', qt);
+ *   }
+ * });
+ *
+ * // At this point, implement any other service worker caching strategies
+ * // appropriate for your web app.
+ *
+ * @alias goog.offlineGoogleAnalytics.initialize
+ * @param {Object=}   config Optional configuration arguments.
+ * @param {Object=}   config.parameterOverrides Optional
+ *                    [Measurement Protocol parameters](https://developers.google.com/analytics/devguides/collection/protocol/v1/parameters),
+ *                    expressed as key/value pairs, to be added to replayed
+ *                    Google Analytics requests. This can be used to, e.g., set
+ *                    a custom dimension indicating that the request was
+ *                    replayed.
+ * @param {Function=} config.hitFilter Optional
+ *                    A function that allows you to modify the hit parameters
+ *                    prior to replaying the hit. The function is invoked with
+ *                    the original hit's URLSearchParams object as its only
+ *                    argument. To abort the hit and prevent it from being
+ *                    replayed, throw an error.
+ * @returns {undefined}
+ */
+const initialize = (config = {}) => {
+  let previousHitFailed = false;
+
+  self.addEventListener('fetch', event => {
+    const url = new URL(event.request.url);
+    const request = event.request;
+
+    if (url.hostname === constants.URL.HOST) {
+      if (url.pathname === constants.URL.COLLECT_PATH) {
+        // If this is a /collect request, then use a network-first strategy,
+        // falling back to queueing the request in IndexedDB.
+
+        // Make a clone of the request before we use it, in case we need
+        // to read the request body later on.
+        const clonedRequest = request.clone();
+
+        event.respondWith(
+          fetch(request).then(response => {
+            if (previousHitFailed) {
+              replayQueuedRequests(config);
+            }
+            previousHitFailed = false;
+            return response;
+          }, error => {
+            log('Enqueuing failed request...');
+            previousHitFailed = true;
+            return enqueueRequest(clonedRequest).then(() => Response.error());
+          })
+        );
+      } else if (url.pathname === constants.URL.ANALYTICS_JS_PATH) {
+        // If this is a request for the Google Analytics JavaScript library,
+        // use the network first, falling back to the previously cached copy.
+        event.respondWith(
+          caches.open(constants.CACHE_NAME).then(cache => {
+            return fetch(request).then(response => {
+              return cache.put(request, response.clone()).then(() => response);
+            }).catch(error => {
+              log(error);
+              return cache.match(request);
+            });
+          })
+        );
+      }
+    }
+  });
+
+  replayQueuedRequests(config);
+};
+
+module.exports = {initialize};
+
+},{"../../../lib/log.js":2,"./lib/constants.js":6,"./lib/enqueue-request.js":7,"./lib/replay-queued-requests.js":8}],6:[function(require,module,exports){
+/*
+ Copyright 2016 Google Inc. All Rights Reserved.
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
 
      http://www.apache.org/licenses/LICENSE-2.0
 
@@ -516,7 +637,7 @@ module.exports = {
     VERSION: 1
   },
   MAX_ANALYTICS_BATCH_SIZE: 20,
-  STOP_RETRYING_AFTER: 86400000, // One day, in milliseconds.
+  STOP_RETRYING_AFTER: 1000 * 60 * 60 * 48, // Two days, in milliseconds.
   URL: {
     ANALYTICS_JS_PATH: '/analytics.js',
     COLLECT_PATH: '/collect',
@@ -524,7 +645,7 @@ module.exports = {
   }
 };
 
-},{}],6:[function(require,module,exports){
+},{}],7:[function(require,module,exports){
 /*
  Copyright 2016 Google Inc. All Rights Reserved.
  Licensed under the Apache License, Version 2.0 (the "License");
@@ -545,7 +666,6 @@ const constants = require('./constants.js');
 
 const idbHelper = new IDBHelper(constants.IDB.NAME, constants.IDB.VERSION,
   constants.IDB.STORE);
-self.a = idbHelper;
 
 /**
  * Adds a URL to IndexedDB, along with the current timestamp.
@@ -574,7 +694,7 @@ module.exports = (request, time) => {
   });
 };
 
-},{"../../../../lib/idb-helper.js":1,"./constants.js":5}],7:[function(require,module,exports){
+},{"../../../../lib/idb-helper.js":1,"./constants.js":6}],8:[function(require,module,exports){
 /*
  Copyright 2016 Google Inc. All Rights Reserved.
  Licensed under the Apache License, Version 2.0 (the "License");
@@ -592,7 +712,6 @@ module.exports = (request, time) => {
 
 const IDBHelper = require('../../../../lib/idb-helper.js');
 const constants = require('./constants.js');
-const log = require('../../../../lib/log.js');
 
 const idbHelper = new IDBHelper(constants.IDB.NAME, constants.IDB.VERSION,
   constants.IDB.STORE);
@@ -604,51 +723,54 @@ const idbHelper = new IDBHelper(constants.IDB.NAME, constants.IDB.VERSION,
  * Returns a promise that resolves when the replaying is complete.
  *
  * @private
- * @param {Object=} additionalParameters URL parameters, expressed as key/value
+ * @param {Object=} parameterOverrides URL parameters, expressed as key/value
  *                 pairs, to be added to replayed Google Analytics requests.
  *                 This can be used to, e.g., set a custom dimension indicating
  *                 that the request was replayed from the service worker.
  * @returns {Promise.<T>}
  */
-module.exports = additionalParameters => {
-  additionalParameters = additionalParameters || {};
-
+module.exports = ({parameterOverrides = {}, hitFilter} = {}) => {
   return idbHelper.getAllKeys().then(urls => {
     return Promise.all(urls.map(url => {
-      return idbHelper.get(url).then(queuedTime => {
+      return idbHelper.get(url).then(hitTime => {
+        const queueTime = Date.now() - hitTime;
         const newUrl = new URL(url);
 
-        // URLSearchParams was added in Chrome 49.
-        // On the off chance we're on a browser that lacks support, we won't
-        // set additionParameters, but at least we'll set qt=.
-        if ('searchParams' in newUrl) {
-          additionalParameters.qt = queuedTime;
-          // Call sort() on the keys so that there's a reliable order of calls
-          // to searchParams.set(). This isn't important in terms of
-          // functionality, but it will make testing easier, since the
-          // URL serialization depends on the order in which .set() is called.
-          Object.keys(additionalParameters).sort().forEach(parameter => {
-            newUrl.searchParams.set(parameter, additionalParameters[parameter]);
-          });
-        } else {
-          log('The browser does not support URLSearchParams, ' +
-            'so not setting additional parameters.');
-          newUrl.search += (newUrl.search ? '&' : '') + 'qt=' + queuedTime;
+        // Do not attempt to replay hits that are too old.
+        if (queueTime > constants.STOP_RETRYING_AFTER) return;
+
+        // Do not attempt to replay hits in browsers without URLSearchParams support.
+        if (!('searchParams' in newUrl)) return;
+
+        parameterOverrides.qt = queueTime;
+
+        // Call sort() on the keys so that there's a reliable order of calls
+        // to searchParams.set(). This isn't important in terms of
+        // functionality, but it will make testing easier, since the
+        // URL serialization depends on the order in which .set() is called.
+        Object.keys(parameterOverrides).sort().forEach(parameter => {
+          newUrl.searchParams.set(parameter, parameterOverrides[parameter]);
+        });
+
+        // If the hitFilter config option was passed and is a function,
+        // invoke it with searchParams as its argument allowing the function
+        // to modify the hit prior to sending it. The function can also
+        // throw an error to abort the hit if needed.
+        if (typeof hitFilter === 'function') {
+          try {
+            hitFilter(newUrl.searchParams);
+          } catch (err) {
+            return;
+          }
         }
 
-        return fetch(newUrl.toString()).catch(error => {
-          // If this was queued recently, then rethrow the error, to prevent
-          // the entry from being deleted. It will be retried again later.
-          if ((Date.now() - queuedTime) < constants.STOP_RETRYING_AFTER) {
-            throw error;
-          }
-        });
+        return fetch(newUrl.toString());
       }).then(() => idbHelper.delete(url));
     }));
   });
 };
 
-},{"../../../../lib/idb-helper.js":1,"../../../../lib/log.js":2,"./constants.js":5}],8:[function(require,module,exports){
+},{"../../../../lib/idb-helper.js":1,"./constants.js":6}],9:[function(require,module,exports){
 /*
  Copyright 2016 Google Inc. All Rights Reserved.
  Licensed under the Apache License, Version 2.0 (the "License");
@@ -664,93 +786,11 @@ module.exports = additionalParameters => {
 
 /* eslint-env worker, serviceworker */
 
-const constants = require('./lib/constants.js');
-const enqueueRequest = require('./lib/enqueue-request.js');
-const log = require('../../../lib/log.js');
-const replayQueuedRequests = require('./lib/replay-queued-requests.js');
+const offlineGoogleAnalytics = require('.');
 const scope = require('../../../lib/scope.js');
-
-/**
- * In order to use the library, call`goog.offlineGoogleAnalytics.initialize()`.
- * It will take care of setting up service worker `fetch` handlers to ensure
- * that the Google Analytics JavaScript is available offline, and that any
- * Google Analytics requests made while offline are saved (using `IndexedDB`)
- * and retried the next time the service worker starts up.
- *
- * @example
- * // This code should live inside your service worker JavaScript, ideally
- * // before any other 'fetch' event handlers are defined:
- *
- * // First, import the library into the service worker global scope:
- * importScripts('path/to/offline-google-analytics-import.js');
- *
- * // Then, call goog.offlineGoogleAnalytics.initialize():
- * goog.offlineGoogleAnalytics.initialize({
- *   parameterOverrides: {
- *     // Optionally, pass in an Object with additional parameters that will be
- *     // included in each replayed request.
- *     dimension1: 'Some Value',
- *     dimension2: 'Some Other Value'
- *   }
- * });
- *
- * // At this point, implement any other service worker caching strategies
- * // appropriate for your web app.
- *
- * @alias goog.offlineGoogleAnalytics.initialize
- * @param {Object=} config Optional configuration arguments.
- * @param {Object=} config.parameterOverrides Optional URL parameters, expressed
- *                  as key/value pairs, to be added to replayed Google Analytics
- *                  requests. This can be used to, e.g., set a custom dimension
- *                  indicating that the request was replayed.
- * @returns {undefined}
- */
-const initialize = config => {
-  config = config || {};
-
-  self.addEventListener('fetch', event => {
-    const url = new URL(event.request.url);
-    const request = event.request;
-
-    if (url.hostname === constants.URL.HOST) {
-      if (url.pathname === constants.URL.COLLECT_PATH) {
-        // If this is a /collect request, then use a network-first strategy,
-        // falling back to queueing the request in IndexedDB.
-
-        // Make a clone of the request before we use it, in case we need
-        // to read the request body later on.
-        const clonedRequest = request.clone();
-
-        event.respondWith(
-          fetch(request).catch(error => {
-            log('Enqueuing failed request...');
-            return enqueueRequest(clonedRequest).then(() => error);
-          })
-        );
-      } else if (url.pathname === constants.URL.ANALYTICS_JS_PATH) {
-        // If this is a request for the Google Analytics JavaScript library,
-        // use the network first, falling back to the previously cached copy.
-        event.respondWith(
-          caches.open(constants.CACHE_NAME).then(cache => {
-            return fetch(request).then(response => {
-              return cache.put(request, response.clone()).then(() => response);
-            }).catch(error => {
-              log(error);
-              return cache.match(request);
-            });
-          })
-        );
-      }
-    }
-  });
-
-  replayQueuedRequests(config.parameterOverrides || {});
-};
 
 // Add the function to the global service worker scope,
 // as goog.offlineGoogleAnalytics.initialize.
-scope('offlineGoogleAnalytics', {
-  initialize: initialize
-});
+scope('offlineGoogleAnalytics', offlineGoogleAnalytics);
 
-},{"../../../lib/log.js":2,"../../../lib/scope.js":3,"./lib/constants.js":5,"./lib/enqueue-request.js":6,"./lib/replay-queued-requests.js":7}]},{},[8]);
+},{".":5,"../../../lib/scope.js":3}]},{},[9]);
